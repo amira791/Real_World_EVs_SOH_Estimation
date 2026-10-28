@@ -1,0 +1,2 @@
+vehicle,n_events,n_ok30,n_ok40,n_ok50,n_window,odo_min,odo_max,ref_is_bol,rho_A_vs_odo,rho_B_vs_odo,rho_A_vs_B,label_ok
+vin93,329,143,134,122,114,173.1,66178.0,True,0.6859836173216455,-0.31742736700589985,0.07713228072826168,True
