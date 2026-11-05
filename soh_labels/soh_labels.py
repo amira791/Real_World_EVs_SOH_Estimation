@@ -1,256 +1,159 @@
 #!/usr/bin/env python3
-"""SOH Ground Truth Label Generator (Without OCV-SOC Table)
+"""BMS-based SOH pseudo-labels, single vehicle (corrected version).
 
-Method: Ampere-Hour Integration over Wide-SOC Charging Events
-Reference: Liu et al., Nature Communications (2025)
+Usage:  python soh_label_generator_fixed.py path/to/vin93.csv [output_dir]
+Labels are pseudo-labels: they inherit BMS SOC error (no OCV table available).
 """
-
 import os
+import sys
+
 import numpy as np
 import pandas as pd
 
-# ==============================================================================
-# 1. FILE PATHS & FLEET PARAMETERS
-# ==============================================================================
-INPUT_PATH = r"\\FS19\HomeDir\129963\Desktop\DR2\4 Coding\sample_data\vin93.csv"
-OUTPUT_DIR = (
-    r"\\FS19\HomeDir\129963\Desktop\DR2\4 Coding\sample_data\vin93_soh_results"
-)
+DEFAULT_INPUT = r"C:\Users\admin\Desktop\DR2\11 All Datasets\07 300-EV Real-World BMS Dataset Liu et al. (2025)\300EV_Sample\vin93.csv"
+DEFAULT_OUT = r"C:\Users\admin\Desktop\DR2\16 Contributions\Contr05\Real_World_EVs_SOH_Estimation\soh_labels\results"
 
-RATED_AH = 155.0  # Rated pack capacity in Ah[cite: 4]
-MIN_I_CHG = 1.0  # Minimum charging current in A to filter noise
-MAX_I_CHG = 250.0  # Maximum plausible current in A to filter sensor errors
-MAX_SPEED = 2.0  # Max vehicle speed in km/h to account for GPS/speed drift[cite: 7]
-MIN_DUR_SEC = 300  # Minimum charging duration (5 minutes)
-MAX_GAP_SEC = 60  # Merge charge sub-segments separated by <= 60 seconds
-MIN_DSOC = 25.0  # Minimum required ΔSOC (%) to ensure low BMS error[cite: 7]
-FULL_SOC_MIN = 95.0  # Minimum end SOC (%) for full-charge classification[cite: 7, 9]
-FULL_V_MIN = 4.15  # Minimum cell max-voltage (V) for full charge[cite: 7, 9]
+RATED_AH = 155.0
+CHARGE_SIGN = -1        # in this dataset charging current is NEGATIVE (discharge positive)
+MIN_I_CHG = 5.0         # A
+MAX_I_CHG = 250.0       # A
+MAX_SPEED = 2.0         # km/h
+MIN_DUR_SEC = 600
+MERGE_GAP_SEC = 60
+RESUME_GAP_SEC = 600    # re-join an interrupted charge if odometer and SOC are continuous
+MAX_STEP_SEC = 30       # a time step longer than this is a data gap (not integrated)
+MAX_MISSING = 0.02      # max share of event duration that may be missing
+SOC_DROP_MAX = 2        # points
+MIN_DSOC = 50.0         # wide SOC window (also try 40 and 60)
+FULL_SOC_MIN = 99.0     # event must END at full charge (BMS SOC jumps to 100)
+FULL_V_MIN = 4.20       # AND max cell voltage near the 4.25 V cutoff
 
-USECOLS = [
-    "terminaltime",
-    "soc",
-    "speed",
-    "totalodometer",
-    "totalcurrent",
-    "minvoltagebattery",
-    "maxvoltagebattery",
-]
+USECOLS = ["terminaltime", "soc", "speed", "totalodometer", "chargestatus",
+           "totalcurrent", "minvoltagebattery", "maxvoltagebattery"]
 
 
-# ==============================================================================
-# 2. PREPROCESSING & SIGNAL CLEANING
-# ==============================================================================
 def load_and_clean_data(path):
-    """Loads CSV, standardizes column names, converts timestamps and voltage units."""
     print(f"[*] Reading dataset: {path}")
     df = pd.read_csv(path, usecols=lambda c: c.lower() in USECOLS)
     df.columns = [c.lower() for c in df.columns]
 
-    # Convert timestamps to numeric seconds
+    # time in seconds (keep numeric values as they are; no datetime round trip)
     if pd.api.types.is_numeric_dtype(df["terminaltime"]):
-        unit = "ms" if df["terminaltime"].median() > 1e11 else "s"
-        df["datetime"] = pd.to_datetime(df["terminaltime"], unit=unit)
+        df["t_sec"] = df["terminaltime"].astype(float)
     else:
-        df["datetime"] = pd.to_datetime(df["terminaltime"])
+        dt = pd.to_datetime(df["terminaltime"])
+        df["t_sec"] = (dt - pd.Timestamp("1970-01-01")).dt.total_seconds()
 
-    df["t_sec"] = df["datetime"].astype("int64") // 1e9
-
-    # Sort and remove duplicate timestamps
-    df = (
-        df.dropna(subset=["t_sec", "totalcurrent", "soc"])
-        .drop_duplicates("t_sec")
-        .sort_values("t_sec")
-        .reset_index(drop=True)
-    )
-
-    # Standardize cell voltage units (convert mV to V if necessary)
     for col in ("minvoltagebattery", "maxvoltagebattery"):
-        if col in df.columns and df[col].median() > 100.0:
+        if df[col].median() > 100.0:           # mV -> V
             df[col] = df[col] / 1000.0
 
-    # Auto-detect current polarity (ensure charging current is positive)
-    if df["totalcurrent"].median() < 0:
-        df["i_ch"] = -df["totalcurrent"]
-    else:
-        df["i_ch"] = df["totalcurrent"]
+    # Invalid frames decode to: current -1000 A, status 255, cell voltage 0, temp -40 C.
+    n0 = len(df)
+    bad = ((df["totalcurrent"].abs() >= 1000)
+           | (df["maxvoltagebattery"] <= 0) | (df["minvoltagebattery"] <= 0))
+    if "chargestatus" in df.columns:
+        bad |= df["chargestatus"] == 255
+    df = df[~bad]
+    print(f"[*] Dropped {n0 - len(df)} invalid frames")
 
+    df = (df.dropna(subset=["t_sec", "totalcurrent", "soc"])
+            .drop_duplicates("t_sec").sort_values("t_sec").reset_index(drop=True))
+    df["i_ch"] = CHARGE_SIGN * df["totalcurrent"]    # charging current positive
     return df
 
 
-# ==============================================================================
-# 3. CHARGING EVENT SEGMENTATION & AMPERE-HOUR INTEGRATION
-# ==============================================================================
 def extract_charging_events(df, vid):
-    """Isolates continuous stationary charging sessions and computes capacity."""
-    # Filter stationary charging states
-    is_charging = (
-        (df["i_ch"] >= MIN_I_CHG)
-        & (df["i_ch"] <= MAX_I_CHG)
-        & (df["speed"] <= MAX_SPEED)
-    ).to_numpy()
-
-    if not is_charging.any():
+    mask = ((df["i_ch"] >= MIN_I_CHG) & (df["i_ch"] <= MAX_I_CHG)
+            & (df["speed"] <= MAX_SPEED)).to_numpy()
+    if not mask.any():
         print("[-] No points matched charging criteria.")
         return []
+    edges = np.diff(np.r_[0, mask.astype(int), 0])
+    starts, ends = np.where(edges == 1)[0], np.where(edges == -1)[0] - 1
 
-    # Detect start and end bounds
-    edges = np.diff(np.r_[0, is_charging.astype(int), 0])
-    starts = np.where(edges == 1)[0]
-    ends = np.where(edges == -1)[0] - 1
-
-    t_array = df["t_sec"].to_numpy()
-
-    # Merge consecutive sub-segments separated by brief gaps (<= MAX_GAP_SEC)
-    merged_groups = []
+    t = df["t_sec"].to_numpy()
+    odo = df["totalodometer"].to_numpy()
+    soc_all = df["soc"].to_numpy()
+    groups = []
     for s, e in zip(starts, ends):
-        if (
-            merged_groups
-            and t_array[s] - t_array[merged_groups[-1][1]] <= MAX_GAP_SEC
-        ):
-            merged_groups[-1][1] = e
-        else:
-            merged_groups.append([s, e])
+        if groups:
+            pe = groups[-1][1]
+            gap = t[s] - t[pe]
+            resumed = (gap <= RESUME_GAP_SEC and abs(odo[s] - odo[pe]) <= 0.2
+                       and abs(soc_all[s] - soc_all[pe]) <= 2)
+            if gap <= MERGE_GAP_SEC or resumed:
+                groups[-1][1] = e
+                continue
+        groups.append([s, e])
+    print(f"[*] Analyzing {len(groups)} detected charging session(s)...")
 
     events = []
-    print(f"[*] Analyzing {len(merged_groups)} detected charging session(s)...")
-
-    for k, (s, e) in enumerate(merged_groups):
+    for k, (s, e) in enumerate(groups):
         if e <= s:
             continue
-
-        seg = df.iloc[s : e + 1]
-        t = seg["t_sec"].to_numpy()
-        i = seg["i_ch"].to_numpy()
-        v_max = seg["maxvoltagebattery"].to_numpy()
-        soc = seg["soc"].to_numpy()
-
-        dt = np.diff(t)
-        if len(dt) == 0:
-            continue
-
-        dur_s = t[-1] - t[0]
+        seg = df.iloc[s:e + 1]
+        tt, ii = seg["t_sec"].to_numpy(), seg["i_ch"].to_numpy()
+        v_max, soc = seg["maxvoltagebattery"].to_numpy(), seg["soc"].to_numpy()
+        dt = np.diff(tt)
+        dur = tt[-1] - tt[0]
         dsoc = soc[-1] - soc[0]
-
-        # Coulomb Counting (Trapezoidal integration in Ah)
-        dq_steps = (i[1:] + i[:-1]) / 2.0 * (dt / 3600.0)
-        total_q_ah = dq_steps.sum()
-
-        # Full charge condition check
-        is_full = (v_max[-1] >= FULL_V_MIN) or (soc[-1] >= FULL_SOC_MIN)[
-            cite: 7, 9
-        ]
-
-        # Calculate extrapolated 0-100% capacity
-        c_calculated = (
-            total_q_ah / (dsoc / 100.0)
-            if (dsoc > 0 and dsoc <= 100)
-            else np.nan
-        )
-
-        # Validation rules
-        valid = bool(
-            is_full
-            and (dsoc >= MIN_DSOC)
-            and (dur_s >= MIN_DUR_SEC)
-            and np.isfinite(c_calculated)
-            and (0.4 * RATED_AH <= c_calculated <= 1.3 * RATED_AH)
-        )
-
-        events.append(
-            {
-                "vehicle": vid,
-                "event_id": k,
-                "t_start": seg["datetime"].iloc[0],
-                "t_end": seg["datetime"].iloc[-1],
-                "duration_min": round(dur_s / 60.0, 1),
-                "soc_start": soc[0],
-                "soc_end": soc[-1],
-                "delta_soc": round(dsoc, 1),
-                "integrated_ah": round(total_q_ah, 2),
-                "v_max_end": round(v_max[-1], 3),
-                "c_calculated_ah": round(c_calculated, 2)
-                if np.isfinite(c_calculated)
-                else np.nan,
-                "is_full_charge": is_full,
-                "is_valid_event": valid,
-            }
-        )
-
+        ok = dt <= MAX_STEP_SEC
+        dq = (ii[1:] + ii[:-1]) / 2.0 * dt / 3600.0
+        q_ah = dq[ok].sum()
+        missing = dt[~ok].sum() / dur if dur > 0 else 1.0
+        soc_drop = bool((np.diff(soc) < -SOC_DROP_MAX).any())
+        is_full = bool((v_max[-1] >= FULL_V_MIN) and (soc[-1] >= FULL_SOC_MIN))
+        c_calc = q_ah / (dsoc / 100.0) if 0 < dsoc <= 100 else np.nan
+        valid = bool(is_full and dsoc >= MIN_DSOC and dur >= MIN_DUR_SEC
+                     and missing <= MAX_MISSING and not soc_drop
+                     and np.isfinite(c_calc)
+                     and 0.4 * RATED_AH <= c_calc <= 1.3 * RATED_AH)
+        events.append({
+            "vehicle": vid, "event_id": k, "t_start_s": tt[0], "t_end_s": tt[-1],
+            "odometer_km": seg["totalodometer"].iloc[0],
+            "duration_min": round(dur / 60.0, 1),
+            "soc_start": soc[0], "soc_end": soc[-1], "delta_soc": round(dsoc, 1),
+            "integrated_ah": round(q_ah, 2), "missing_frac": round(missing, 3),
+            "soc_drop": soc_drop, "v_max_end": round(v_max[-1], 3),
+            "c_calculated_ah": round(c_calc, 2) if np.isfinite(c_calc) else np.nan,
+            "is_full_charge": is_full, "is_valid_event": valid})
     return events
 
 
-# ==============================================================================
-# 4. SOH LABEL GENERATION & SMOOTHING
-# ==============================================================================
-def compute_soh_metrics(df_events):
-    """Calculates SOH values and filters local outliers using rolling MAD."""
-    df_events["soh_calculated"] = np.nan
-    df_events["soh_smoothed"] = np.nan
-
-    valid_mask = df_events["is_valid_event"]
-    if valid_mask.any():
-        # SOH = C_calculated / C_rated
-        soh_vals = df_events.loc[valid_mask, "c_calculated_ah"] / RATED_AH[cite: 1, 4]
-        df_events.loc[valid_mask, "soh_calculated"] = soh_vals
-
-        # Rolling median smoothing
-        smooth_soh = soh_vals.rolling(
-            window=5, center=True, min_periods=1
-        ).median()
-        df_events.loc[valid_mask, "soh_smoothed"] = smooth_soh
-
-    return df_events
+def compute_soh_metrics(ev):
+    ev["soh_calculated"] = np.nan
+    ev["soh_smoothed"] = np.nan
+    m = ev["is_valid_event"]
+    if m.any():
+        soh = ev.loc[m, "c_calculated_ah"] / RATED_AH
+        ev.loc[m, "soh_calculated"] = soh
+        ev.loc[m, "soh_smoothed"] = soh.rolling(5, center=True, min_periods=1).median()
+    return ev
 
 
-# ==============================================================================
-# 5. MAIN EXECUTION
-# ==============================================================================
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    vid = os.path.splitext(os.path.basename(INPUT_PATH))[0]
+    path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_INPUT
+    out_dir = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_OUT
+    os.makedirs(out_dir, exist_ok=True)
+    vid = os.path.splitext(os.path.basename(path))[0]
 
-    try:
-        df_raw = load_and_clean_data(INPUT_PATH)
-    except Exception as err:
-        print(f"[-] Error loading file: {err}")
-        return
-
-    events = extract_charging_events(df_raw, vid)
+    df = load_and_clean_data(path)
+    events = extract_charging_events(df, vid)
     if not events:
-        print("[-] No charging events were extracted.")
         return
+    ev = compute_soh_metrics(pd.DataFrame(events))
 
-    df_events = pd.DataFrame(events)
-    df_results = compute_soh_metrics(df_events)
+    # sanity check on the current sign: real charges must RAISE the SOC
+    share_up = (ev["delta_soc"] > 0).mean()
+    print(f"[*] Sanity check: {share_up:.0%} of detected events have delta SOC > 0")
+    if share_up < 0.5:
+        print("[!] WARNING: most 'charging' events lower the SOC. Check CHARGE_SIGN.")
 
-    # Save to CSV
-    output_file = os.path.join(OUTPUT_DIR, f"{vid}_soh_labels.csv")
-    df_results.to_csv(output_file, index=False)
-
-    # Output detailed report
-    print("\n" + "=" * 65)
-    print(f"          CHARGING SESSIONS DIAGNOSTIC & SOH SUMMARY")
-    print("=" * 65)
-    for idx, row in df_results.iterrows():
-        status = "VALID" if row["is_valid_event"] else "INVALID"
-        soh_str = (
-            f"{row['soh_calculated']*100:.2f}%"
-            if pd.notna(row["soh_calculated"])
-            else "N/A"
-        )
-        print(
-            f"Event {row['event_id']:02d} | Status: {status:<7} | "
-            f"SOC: {row['soc_start']:>4.1f}% -> {row['soc_end']:>4.1f}% (ΔSOC: {row['delta_soc']:>4.1f}%) | "
-            f"V_end: {row['v_max_end']:.2f}V | SOH: {soh_str}"
-        )
-
-    valid_count = int(df_results["is_valid_event"].sum())
-    print("=" * 65)
-    print(f"Total Charging Events Detected   : {len(df_results)}")
-    print(f"Valid SOH Ground Truth Labels    : {valid_count}")
-    print(f"Output File Path                 : {output_file}")
-    print("=" * 65 + "\n")
+    out = os.path.join(out_dir, f"{vid}_soh_labels.csv")
+    ev.to_csv(out, index=False)
+    print(f"Total events: {len(ev)} | full-charge: {int(ev.is_full_charge.sum())} | "
+          f"valid labels: {int(ev.is_valid_event.sum())}\nSaved: {out}")
 
 
 if __name__ == "__main__":
